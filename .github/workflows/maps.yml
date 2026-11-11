@@ -1,0 +1,48 @@
+name: Map tiles
+# Cuts newly uploaded maps into zoomable tiles, makes clearer copies, reads place names and looks for catalogue records.
+# Started by the site when a map is added, and once a day as a safety net. Nothing about the maps is printed here: the full log is sent privately to the site.
+on:
+  repository_dispatch:
+    types: [map-tiles]
+  schedule:
+    - cron: '23 2 * * *'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency: map-tiles
+jobs:
+  tiles:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      API: ${{ secrets.SITE }}
+      MAP_OPS_KEY: ${{ secrets.JOBS_KEY }}
+    steps:
+      - name: Anything waiting?
+        id: n
+        run: |
+          [ -n "$API" ] && [ -n "$MAP_OPS_KEY" ] || { echo "not set up yet"; echo "n=0" >> "$GITHUB_OUTPUT"; exit 0; }
+          echo "site answered $(curl -s -o /dev/null -w '%{http_code}' -H "x-ops-key: $MAP_OPS_KEY" "$API/api/ops/maps/nofp" || echo 000)"
+          g() { curl -s -H "x-ops-key: $MAP_OPS_KEY" "$API/api/ops/maps/$1" | jq "$2" 2>/dev/null || echo 0; }
+          a=$(g pending '.maps | length'); b=$(g nofp '.maps | length'); c=$(g clear '.maps | length')
+          d=$(g toread 'if .left > 0 then (.maps | length) else 0 end'); e=$(g tocheck '.posts | length')
+          echo "waiting $a, fingerprints $b, clearer copies $c, to read $d, to check $e"; echo "n=$((a + b + c + d + e))" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        if: steps.n.outputs.n != '0'
+        with: { sparse-checkout: 'ops', fetch-depth: 1 }
+      - uses: actions/setup-node@v4
+        if: steps.n.outputs.n != '0'
+        with: { node-version: 22 }
+      - name: Tools
+        if: steps.n.outputs.n != '0'
+        run: |
+          sudo apt-get install -y -qq libimage-exiftool-perl >/dev/null
+          cd ops/maps && npm i --no-save sharp@0.34.5 >/dev/null 2>&1
+      - name: Cut, read and check the maps
+        if: steps.n.outputs.n != '0'
+        run: |
+          node ops/maps/tile.mjs > /tmp/job.log 2>&1; echo "tiles finished (exit $?)"
+          node ops/maps/check.mjs >> /tmp/job.log 2>&1; echo "checks finished (exit $?), $(wc -l < /tmp/job.log) log lines sent privately to the site"
+      - name: Send the log privately
+        if: always() && steps.n.outputs.n != '0'
+        run: '[ -f /tmp/job.log ] && curl -s -o /dev/null -w "log %{http_code}\n" -X POST -H "x-ops-key: $MAP_OPS_KEY" --data-binary @/tmp/job.log "$API/api/ops/joblog?job=maps" || true'
